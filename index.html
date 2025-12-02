@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -251,9 +250,11 @@
 
   <script>
     // ===== Config (Ireland) =====
+    // IMPORTANT: You need to create a new OAuth client in Genesys Cloud for this app
+    // or update the redirect URI to match where this app is hosted
     const CONFIG = {
       clientId: 'fe305808-b368-4547-8af9-325d28d552bb',
-      redirectUri: 'https://gmcglynn88.github.io/ConversationExplorer/',
+      redirectUri: window.location.origin + window.location.pathname, // Dynamic redirect URI
       loginHost: 'https://login.mypurecloud.ie',
       apiHost: 'https://api.mypurecloud.ie'
     };
@@ -315,39 +316,111 @@
     // ===== Auth =====
     function parseTokenFromHash(){
       const params = new URLSearchParams(location.hash.replace(/^#/, ''));
-      return { token: params.get('access_token'), error: params.get('error'), errorDescription: params.get('error_description') };
+      return { 
+        token: params.get('access_token'), 
+        error: params.get('error'), 
+        errorDescription: params.get('error_description'),
+        expiresIn: params.get('expires_in')
+      };
     }
+    
     function authUrl(){
       return `${CONFIG.loginHost}/oauth/authorize?client_id=${encodeURIComponent(CONFIG.clientId)}&response_type=token&redirect_uri=${encodeURIComponent(CONFIG.redirectUri)}`;
     }
+    
     function initAuth(){
-      const {token, error} = parseTokenFromHash();
-      if(location.hash) history.replaceState(null,'',location.pathname);
+      console.log('Initializing auth...');
+      console.log('Current URL:', window.location.href);
+      console.log('Redirect URI:', CONFIG.redirectUri);
+      
+      const {token, error, errorDescription, expiresIn} = parseTokenFromHash();
+      
+      if(location.hash) {
+        console.log('Hash found in URL:', location.hash.substring(0, 100) + '...');
+        history.replaceState(null, '', location.pathname + location.search);
+      }
 
       if(token){
+        console.log('Token received via OAuth redirect');
         sessionStorage.removeItem('gc_auto_auth_attempted');
-        state.token = token; showMain(); setupDateLimits(); setupTabs(); fetchAllUsers();
+        state.token = token; 
+        
+        // Store token in sessionStorage for persistence
+        sessionStorage.setItem('gc_token', token);
+        if (expiresIn) {
+          const expiryTime = Date.now() + (parseInt(expiresIn) * 1000);
+          sessionStorage.setItem('gc_token_expiry', expiryTime.toString());
+        }
+        
+        showMain(); 
+        setupDateLimits(); 
+        setupTabs(); 
+        fetchAllUsers();
         return;
+      }
+
+      // Check if we have a stored token
+      const storedToken = sessionStorage.getItem('gc_token');
+      const storedExpiry = sessionStorage.getItem('gc_token_expiry');
+      
+      if (storedToken && storedExpiry && Date.now() < parseInt(storedExpiry)) {
+        console.log('Using stored token');
+        state.token = storedToken;
+        showMain();
+        setupDateLimits();
+        setupTabs();
+        fetchAllUsers();
+        return;
+      }
+
+      // Clear expired token
+      if (storedToken) {
+        sessionStorage.removeItem('gc_token');
+        sessionStorage.removeItem('gc_token_expiry');
       }
 
       const attempted = sessionStorage.getItem('gc_auto_auth_attempted');
       if(!attempted && !error){
+        console.log('No stored token, attempting auto-auth');
         sessionStorage.setItem('gc_auto_auth_attempted','1');
         location.assign(authUrl());
         return;
       }
 
+      if (error) {
+        console.error('OAuth error:', error, errorDescription);
+        setStatus(`Authentication failed: ${errorDescription || error}`, true);
+      }
+
       $('signinBtn').style.display = 'inline-block';
-      $('signinBtn').onclick = () => { sessionStorage.setItem('gc_auto_auth_attempted','1'); location.assign(authUrl()); };
+      $('signinBtn').onclick = () => { 
+        sessionStorage.setItem('gc_auto_auth_attempted','1'); 
+        location.assign(authUrl()); 
+      };
       $('authStatus').style.display = 'none';
     }
 
     // ===== API helper =====
     async function api(path){
       if(!state.token) throw new Error('Not authenticated');
-      const res = await fetch(`${CONFIG.apiHost}${path}`, { headers:{Authorization:`Bearer ${state.token}`} });
-      if(res.status===401||res.status===403) throw new Error(`Authentication error (${res.status}). Please refresh.`);
-      if(!res.ok){ const t = await res.text().catch(()=> ''); throw new Error(`API Error: ${res.status} ${res.statusText}${t?` - ${t.slice(0,200)}`:''}`); }
+      const res = await fetch(`${CONFIG.apiHost}${path}`, { 
+        headers:{
+          Authorization:`Bearer ${state.token}`,
+          'Content-Type': 'application/json'
+        } 
+      });
+      if(res.status===401||res.status===403) {
+        // Token expired, clear and retry auth
+        sessionStorage.removeItem('gc_token');
+        sessionStorage.removeItem('gc_token_expiry');
+        sessionStorage.removeItem('gc_auto_auth_attempted');
+        location.reload();
+        throw new Error(`Authentication error (${res.status}). Please refresh.`);
+      }
+      if(!res.ok){ 
+        const t = await res.text().catch(()=> ''); 
+        throw new Error(`API Error: ${res.status} ${res.statusText}${t?` - ${t.slice(0,200)}`:''}`); 
+      }
       return res.json();
     }
 
@@ -365,13 +438,23 @@
         populateUserSelect(state.users);
         populateMatrixAgentSelects(state.users);
         setStatus(`Loaded ${state.users.length} users`); setLoading(false);
-      }catch(e){ setStatus(`Failed to load users: ${e.message}`, true); setLoading(false); $('agentSelect').innerHTML='<option>Failed to load users</option>'; }
+      }catch(e){ 
+        console.error('Error loading users:', e);
+        setStatus(`Failed to load users: ${e.message}`, true); 
+        setLoading(false); 
+        $('agentSelect').innerHTML='<option>Failed to load users</option>'; 
+      }
     }
+    
     function populateUserSelect(users){
       const sel=$('agentSelect');
       sel.innerHTML = '<option value="">Select an agent…</option>' + users.map(u=>`<option value="${u.id}">${u.name||'(Unnamed)'}</option>`).join('');
-      sel.onchange=()=>{ const u = users.find(x=>x.id===sel.value); state.selectedAgent=u||null; };
+      sel.onchange=()=>{ 
+        const u = users.find(x=>x.id===sel.value); 
+        state.selectedAgent=u||null; 
+      };
     }
+    
     function populateMatrixAgentSelects(users) {
       const queueSel = $('queueMatrixAgentSelect');
       const agentSel = $('agentMatrixAgentSelect');
@@ -380,6 +463,7 @@
       queueSel.innerHTML = options;
       agentSel.innerHTML = options;
     }
+    
     $('agentFilter').addEventListener('input', function(){
       const q = this.value.trim().toLowerCase();
       populateUserSelect(q ? state.users.filter(u=>(u.name||'').toLowerCase().includes(q)) : state.users);
@@ -388,13 +472,26 @@
     // ===== Chunking =====
     function chunks(start,end,days){
       const out=[]; const s=new Date(start), e=new Date(end); let cur=new Date(s);
-      while(cur<=e){ let ce=new Date(cur); ce.setDate(ce.getDate()+days-1); if(ce>e) ce=new Date(e);
-        out.push({start:cur.toISOString().slice(0,10), end:ce.toISOString().slice(0,10)}); cur.setDate(cur.getDate()+days);
-      } return out;
+      while(cur<=e){ 
+        let ce=new Date(cur); 
+        ce.setDate(ce.getDate()+days-1); 
+        if(ce>e) ce=new Date(e);
+        out.push({
+          start:cur.toISOString().slice(0,10), 
+          end:ce.toISOString().slice(0,10)
+        }); 
+        cur.setDate(cur.getDate()+days);
+      } 
+      return out;
     }
+    
     function optimalDays(start,end){
       const s=new Date(start), e=new Date(end), total=Math.ceil((e-s)/(1000*60*60*24))+1;
-      if(total<=7) return 7; if(total<=30) return 7; if(total<=90) return 5; if(total<=180) return 3; return 2;
+      if(total<=7) return 7; 
+      if(total<=30) return 7; 
+      if(total<=90) return 5; 
+      if(total<=180) return 3; 
+      return 2;
     }
 
     // ===== Queue helpers =====
@@ -419,6 +516,7 @@
     function isPlaceholderQueueName(name){
       return !name || name === 'Unknown Queue';
     }
+    
     function getKnownQueueName(id){
       const name = state.queues[id];
       if (isPlaceholderQueueName(name)) return null;
@@ -429,6 +527,7 @@
       if (!queueIds || queueIds.length === 0) return;
       const queuesToFetch = queueIds.filter(id => !state.queues[id]);
       if (queuesToFetch.length === 0) return;
+      
       const batchSize = 10;
       for (let i = 0; i < queuesToFetch.length; i += batchSize) {
         const batch = queuesToFetch.slice(i, i + batchSize);
@@ -470,11 +569,21 @@
 
     // ===== Conversation helpers =====
     function getStepStart(p){
-      let t=[]; for(const s of (p.sessions||[])){
-        if(s.startTime){ const v=+new Date(s.startTime); if(!isNaN(v)) t.push(v); }
+      let t=[]; 
+      for(const s of (p.sessions||[])){
+        if(s.startTime){ 
+          const v=+new Date(s.startTime); 
+          if(!isNaN(v)) t.push(v); 
+        }
         for(const seg of (s.segments||[])){
-          if(seg.segmentStart){ const v=+new Date(seg.segmentStart); if(!isNaN(v)) t.push(v); }
-          for(const ev of (seg.events||[])) if(ev.eventTime){ const v=+new Date(ev.eventTime); if(!isNaN(v)) t.push(v); }
+          if(seg.segmentStart){ 
+            const v=+new Date(seg.segmentStart); 
+            if(!isNaN(v)) t.push(v); 
+          }
+          for(const ev of (seg.events||[])) if(ev.eventTime){ 
+            const v=+new Date(ev.eventTime); 
+            if(!isNaN(v)) t.push(v); 
+          }
         }
       }
       return t.length? new Date(Math.min(...t)) : null;
@@ -590,13 +699,23 @@
     // ===== Fetch conversations for transfers =====
     async function fetchConversations(){
       try{
-        if(!state.selectedAgent){ setStatus('Please select an agent first', true); return; }
+        if(!state.selectedAgent){ 
+          setStatus('Please select an agent first', true); 
+          return; 
+        }
         const from=$('fromDate').value, to=$('toDate').value||from;
-        if(!from){ setStatus('Please select a start date', true); return; }
+        if(!from){ 
+          setStatus('Please select a start date', true); 
+          return; 
+        }
         const today = new Date().toISOString().split('T')[0];
-        if(from > today || to > today) { setStatus('Date range cannot be in the future', true); return; }
+        if(from > today || to > today) { 
+          setStatus('Date range cannot be in the future', true); 
+          return; 
+        }
 
-        setStatus('Fetching conversations for transfer analysis…'); setLoading(true);
+        setStatus('Fetching conversations for transfer analysis…'); 
+        setLoading(true);
 
         const auto=$('autoChunk').checked;
         const days = auto? optimalDays(from,to) : (new Date(to)-new Date(from) >= 0 ? (Math.ceil((new Date(to)-new Date(from))/(1000*60*60*24))+1) : 1);
@@ -607,21 +726,49 @@
           : 'Processing range: <strong>' + fmtDMY(from) + ' to ' + fmtDMY(to) + '</strong>';
 
         showProgress();
-        state.conversations=[]; state.convIndex={};
+        state.conversations=[]; 
+        state.convIndex={};
         state.allTransfers = [];
         state.agentTransfers = [];
 
         for(let i=0;i<dateChunks.length;i++){
-          const ch=dateChunks[i]; updateProgress((i/dateChunks.length)*100, i+1, dateChunks.length);
+          const ch=dateChunks[i]; 
+          updateProgress((i/dateChunks.length)*100, i+1, dateChunks.length);
           setStatus('Fetching chunk ' + (i+1) + '/' + dateChunks.length + ': ' + ch.start + ' → ' + ch.end);
           try{
-            const body = { interval: ch.start + 'T00:00:00/' + ch.end + 'T23:59:59', order:'asc', orderBy:'conversationStart', segmentFilters:[{type:'and',predicates:[{type:'dimension',dimension:'userId',operator:'matches',value: state.selectedAgent.id }]}] };
-            const res = await fetch(CONFIG.apiHost + '/api/v2/analytics/conversations/details/query', { method:'POST', headers:{Authorization:'Bearer ' + state.token,'Content-Type':'application/json'}, body:JSON.stringify(body) });
-            if(!res.ok){ const t=await res.text().catch(()=> ''); throw new Error('Details error: ' + res.status + ' ' + res.statusText + (t?' - ' + t.slice(0,200):'')); }
-            const data = await res.json(); const convs = data.conversations||[];
+            const body = { 
+              interval: ch.start + 'T00:00:00/' + ch.end + 'T23:59:59', 
+              order:'asc', 
+              orderBy:'conversationStart', 
+              segmentFilters:[{
+                type:'and',
+                predicates:[{
+                  type:'dimension',
+                  dimension:'userId',
+                  operator:'matches',
+                  value: state.selectedAgent.id 
+                }]
+              }] 
+            };
+            const res = await fetch(CONFIG.apiHost + '/api/v2/analytics/conversations/details/query', { 
+              method:'POST', 
+              headers:{
+                Authorization:'Bearer ' + state.token,
+                'Content-Type':'application/json'
+              }, 
+              body:JSON.stringify(body) 
+            });
+            if(!res.ok){ 
+              const t=await res.text().catch(()=> ''); 
+              throw new Error('Details error: ' + res.status + ' ' + res.statusText + (t?' - ' + t.slice(0,200):'')); 
+            }
+            const data = await res.json(); 
+            const convs = data.conversations||[];
+            
             for(const c of convs) state.convIndex[c.conversationId]=c;
             state.conversations = state.conversations.concat(convs);
             
+            // Analyze transfers for each conversation
             for(const conv of convs) {
               const transferAnalysis = analyzeTransfers(conv);
               if(transferAnalysis.transfers.length > 0) {
@@ -647,19 +794,35 @@
                 }
               }
             }
-          }catch(e){ console.error(e); setStatus('Warning: failed chunk ' + (i+1) + ', continuing…', true); }
+          }catch(e){ 
+            console.error('Error in chunk:', e); 
+            setStatus('Warning: failed chunk ' + (i+1) + ', continuing…', true); 
+          }
+          
+          // Small delay between chunks to avoid rate limiting
           if(i<dateChunks.length-1) await new Promise(r=>setTimeout(r,400));
         }
 
+        // Fetch queue names for better display
         await warmQueueCache(state.conversations);
 
         updateProgress(100, dateChunks.length, dateChunks.length);
+        
+        // Render all transfer views
         renderTransferReport();
         renderQueueTransferMatrix();
         renderAgentTransferMatrix();
-        setStatus('Analyzed ' + state.conversations.length + ' conversations, found ' + state.allTransfers.length + ' agent-initiated transfers');
-        setLoading(false); hideProgress();
-      }catch(e){ setStatus('Error fetching conversations: ' + e.message, true); setLoading(false); hideProgress(); }
+        
+        setStatus(`Analyzed ${state.conversations.length} conversations, found ${state.allTransfers.length} agent-initiated transfers`);
+        setLoading(false); 
+        hideProgress();
+        
+      }catch(e){ 
+        console.error('Error fetching conversations:', e);
+        setStatus('Error fetching conversations: ' + e.message, true); 
+        setLoading(false); 
+        hideProgress(); 
+      }
     }
 
     // ===== Transfer Reporting (agent-initiated only, with fresh queue names) =====
@@ -713,7 +876,7 @@
         </div>
       `;
 
-      // Filters
+      // Apply filters
       const filterType = $('transferFilter').value;
       const searchTerm = $('transferSearch').value.toLowerCase();
 
@@ -746,7 +909,7 @@
         return;
       }
 
-      // Nested UI
+      // Nested UI for conversations with transfers
       let html = '';
       Object.entries(transfersByConversation).forEach(([conversationId, convTransfers]) => {
         const sortedTransfers = convTransfers.sort(
@@ -755,7 +918,7 @@
 
         html += `
           <div class="conversation-transfer-group">
-            <div class="conversation-transfer-header" onclick="this.nextElementSibling.classList.toggle('open')">
+            <div class="conversation-transfer-header" onclick="toggleTransferDetails('${conversationId}')">
               <span>
                 ${conversationId}
                 <span class="conversation-transfer-count">
@@ -764,7 +927,7 @@
               </span>
               <span>${fmt(sortedTransfers[0].conversationStart)}</span>
             </div>
-            <div class="conversation-transfer-details">
+            <div class="conversation-transfer-details" id="transfer-details-${conversationId}">
         `;
 
         sortedTransfers.forEach((transfer, index) => {
@@ -790,6 +953,13 @@
       });
 
       tableContainer.innerHTML = html;
+    }
+    
+    function toggleTransferDetails(conversationId) {
+      const details = document.getElementById(`transfer-details-${conversationId}`);
+      if (details) {
+        details.classList.toggle('open');
+      }
     }
 
     // ===== Queue Transfer Matrix: derive from ACD queue participants only =====
@@ -1036,12 +1206,21 @@
 
     // ===== Events & Init =====
     $('fetchBtn').addEventListener('click', fetchConversations);
+    
     (function init(){
-      const today=new Date(); const weekAgo=new Date(); weekAgo.setDate(today.getDate()-7);
+      // Set default dates (last 7 days)
+      const today=new Date(); 
+      const weekAgo=new Date(); 
+      weekAgo.setDate(today.getDate()-7);
       $('fromDate').value = weekAgo.toISOString().slice(0,10);
       $('toDate').value = today.toISOString().slice(0,10);
+      
+      // Initialize the application
       initAuth();
       setupTransferFilters();
+      
+      // Make toggle function globally available
+      window.toggleTransferDetails = toggleTransferDetails;
     })();
   </script>
 </body>
